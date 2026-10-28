@@ -29,7 +29,7 @@ import { spawn } from 'node:child_process'
 
 export const name = 'dingtalk-triage'
 /** 热更标记：日志 boot 行会带上，用来确认跑的是哪版代码。 */
-const CODEREV = 'rev15'
+const CODEREV = 'rev20'
 /**
  * 进程级 Stream 单例。模块级变量在每个 import 实例里各有一份（换文件名热更时管不到旧模块），
  * globalThis 在同一 Host 进程内共享，所以任何新实例都能断开前任的连接，杜绝多实例抢同一条消息。
@@ -592,9 +592,10 @@ export function apply(ctx, rawConfig) {
     if (existing?.sessionId && existing.project === project.name) {
       return { sessionId: existing.sessionId, fresh: false, turn: existing.turn ?? 1 }
     }
-    const request = { cwd: project.cwd }
+    // session.create 只接受 workspaceId 或 cwd 其中一个，不能同时给：
+    // 有工作区就用工作区（会话会归到该项目分组下），否则退回裸 cwd。
     const workspaceId = await ensureWorkspace(project.cwd)
-    if (workspaceId) request.workspaceId = workspaceId
+    const request = workspaceId ? { workspaceId } : { cwd: project.cwd }
     if (project.agentPreset) request.agentPreset = project.agentPreset
     const created = await session.create(request)
     const sessionId = created?.sessionId
@@ -691,6 +692,12 @@ export function apply(ctx, rawConfig) {
         '1.5 判断问题类型再决定走多重的流程：',
         '  · 取数/口径类（今天多少单、某单当前状态）：不要拆证据面、不要开子会话、不要沉淀链路。直接用本项目的环境 skill 连只读库或日志查，一次拿到结果就回复。输出固定四段：结论 → 数据源（生产/测试 + 库表或平台）→ 时点 → 口径。',
         '  · 现象/异常类（报错、状态不对、同步没到）：走完整流程，先查链路库，命中按最短链路，未命中才拆面。',
+        '  · 需要查日志时：先读 C:/Users/tong/.codex/project-ops-triage/playbooks/common-orion-terminal-command.md，按里面已验证的 Orion 运维平台终端流程走（登录 → machine/list 核机器 → terminal/access 拿令牌 → WebSocket 发 1|cols|rows|token → 命令帧往返）。不要现场重新摸协议，也不要用本机 SSH 硬连生产机器。',
+        '  · 查日志前先自证身份：hostname、id -un 确认机器与环境（生产/测试）；取内容只用 tail -n / sed -n / grep，禁止 tail -f、journalctl -f、watch、vim 这类交互命令。',
+        '  · 取数类固定两步，不许自己另造通道：',
+        '    ① 先读 C:/Users/tong/.codex/project-ops-triage/playbooks/INDEX.md，命中就用文件里的 SQL 与口径，禁止再从代码反推口径；',
+        '    ② 再调 GET http://127.0.0.1:43129/dingtalk-triage/dbquery?project=<项目名>&op=select&sql=<urlencode后SQL> 取数（用 web_fetch 或 pwsh 的 Invoke-RestMethod 都行）。该通道已内置只读事务、SELECT/SHOW 白名单、强制 LIMIT；禁止自己拼 mysql 连接、禁止读凭据文件、禁止写临时 py 脚本。',
+        '    ③ 链路库未命中时才允许自己查证口径，且回复里必须注明「口径为本次查证」。',
         '  · 变更类（订正、重推、改配置）：不要执行，只出方案并说明需要审批。',
         '  · 查库时只读：SET SESSION TRANSACTION READ ONLY、只跑 SELECT/SHOW、必须带 LIMIT 与超时；密码走环境变量或密码文件，绝不出现在命令行、日志和回复里。',
         '  · 本项目的环境入口见这些 skill：' + ((envSkills && envSkills.length) ? envSkills.join('、') : '（未配置，缺这一面就明说没查）') + '。连接资料以这些 skill 为准，不要自己猜连接串、账号或机器。',
@@ -980,8 +987,8 @@ export function apply(ctx, rawConfig) {
       try {
         result = await runTurn({ sessionId, promptText, onAck: ack, imageRefs })
       } catch (error) {
-        // 主会话可能已被用户在网页端删掉：清掉绑定、重建一次再试。
-        if (!/not.?found/i.test(String(error?.message ?? ''))) throw error
+        // 会话被删掉（not-found）或被归档（blocked，pre-step 门禁直接拦死）：清绑定、重建一次再试。
+        if (!/(not.?found|blocked)/i.test(String(error?.message ?? ''))) throw error
         log('session/missing', { bindingKey, sessionId })
         delete state.bindings[bindingKey]
         saveBindings()
@@ -1066,6 +1073,33 @@ export function apply(ctx, rawConfig) {
                 lastTurn: state.lastTurn,
                 logPath,
               })
+            }
+            if (url.pathname === '/dingtalk-triage/inspect') {
+              const sid = url.searchParams.get('session') || ''
+              const tail = Number(url.searchParams.get('tail') || 20)
+              if (!sid) return json(res, 400, { error: '缺少 session 参数' })
+              try {
+                const info = await session.inspect(sid)
+                const events = (info && info.events) || []
+                const out = events.slice(-tail).map((e) => {
+                  const d = e.data || {}
+                  const txt = Array.isArray(d.message && d.message.content)
+                    ? d.message.content.map((b) => b.text || ("<" + b.type + ">")).join(" ")
+                    : (d.arguments || "")
+                  return {
+                    seq: e.seq,
+                    type: e.type,
+                    name: d.name || "",
+                    role: (d.message && d.message.role) || "",
+                    reason: d.reason ? JSON.stringify(d.reason).slice(0, 120) : "",
+                    error: d.error ? JSON.stringify(d.error).slice(0, 160) : "",
+                    text: String(txt).replace(/\s+/g, " ").slice(0, 200),
+                  }
+                })
+                return json(res, 200, { total: events.length, tail: out })
+              } catch (error) {
+                return json(res, 500, { error: oneLine(error?.message ?? error, 300) })
+              }
             }
             if (url.pathname === '/dingtalk-triage/dbquery') {
               const project = url.searchParams.get('project') || ''
