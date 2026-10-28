@@ -23,11 +23,29 @@
  *   会话已不在，若是追问请先向提问人确认上次结论」，不假装记得。
  */
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
+import { connect } from 'node:net'
+import { spawn } from 'node:child_process'
 
 export const name = 'dingtalk-triage'
 /** 热更标记：日志 boot 行会带上，用来确认跑的是哪版代码。 */
-const CODEREV = 'rev9'
+const CODEREV = 'rev15'
+/**
+ * 进程级 Stream 单例。模块级变量在每个 import 实例里各有一份（换文件名热更时管不到旧模块），
+ * globalThis 在同一 Host 进程内共享，所以任何新实例都能断开前任的连接，杜绝多实例抢同一条消息。
+ */
+const STREAM_SLOT = Symbol.for('dsh.dingtalk-triage.stream')
+function takeOverStream() {
+  const previous = globalThis[STREAM_SLOT]
+  if (previous && typeof previous.disconnect === "function") {
+    try { previous.disconnect() } catch { /* 旧连接可能已死 */ }
+    return true
+  }
+  return false
+}
+function publishStream(client) {
+  globalThis[STREAM_SLOT] = client
+}
 /** 只依赖会话控制器；webServer 用可选查找，缺了也不影响钉钉主链路。 */
 export const inject = ['sessionController']
 
@@ -47,6 +65,9 @@ const DEFAULTS = {
   maxReplyChars: 3800,
   selftest: true,
   newCommand: '/new',
+  images: true,
+  envSkills: {},
+  databases: {},
   projectRoots: [],
   excludedProjects: [],
   projectMarkers: [],
@@ -68,6 +89,9 @@ const CONFIG_JSON_SCHEMA = {
     maxReplyChars: { type: 'number' },
     selftest: { type: 'boolean' },
     defaultProject: { type: 'string' },
+    images: { type: 'boolean' },
+    envSkills: { type: 'object' },
+    databases: { type: 'object' },
     projectRoots: { type: 'array', items: { type: 'string' } },
     excludedProjects: { type: 'array', items: { type: 'string' } },
     projectMarkers: { type: 'array', items: { type: 'string' } },
@@ -123,6 +147,37 @@ function normalizeRoute(raw) {
   }
 }
 
+/** 项目 → 环境 skill 名列表；插件只知道「去哪找连接资料」，不含连接细节。 */
+function normalizeEnvSkills(raw) {
+  const out = {}
+  if (!raw || typeof raw !== "object") return out
+  for (const key of Object.keys(raw)) {
+    const value = raw[key]
+    const names = (Array.isArray(value) ? value : [value]).map((item) => str(item, "")).filter(Boolean)
+    if (names.length > 0) out[key] = names
+  }
+  return out
+}
+
+/** 数据库连接资料；密码不进配置，只给密码文件路径。 */
+function normalizeDatabases(raw) {
+  const out = {}
+  if (!raw || typeof raw !== "object") return out
+  for (const key of Object.keys(raw)) {
+    const item = raw[key] && typeof raw[key] === "object" ? raw[key] : {}
+    const host = str(item.host, "")
+    if (!host) continue
+    out[key] = {
+      host,
+      port: num(item.port, 3306),
+      user: str(item.user, ""),
+      database: str(item.database, ""),
+      passwordFile: str(item.passwordFile, ""),
+    }
+  }
+  return out
+}
+
 function normalize(raw) {
   const source = raw && typeof raw === 'object' ? raw : {}
   const projects = list(source.projects)
@@ -153,6 +208,9 @@ function normalize(raw) {
     excludedProjects: list(source.excludedProjects).map((r) => str(r, '')).filter(Boolean),
     projectMarkers: list(source.projectMarkers).map((r) => str(r, '')).filter(Boolean),
     defaultProject: str(source.defaultProject, ''),
+    images: bool(source.images, DEFAULTS.images),
+    envSkills: normalizeEnvSkills(source.envSkills),
+    databases: normalizeDatabases(source.databases),
     allowedStaffIds: list(source.allowedStaffIds).filter((id) => typeof id === 'string' && id.length > 0),
     projects,
     routes,
@@ -218,6 +276,8 @@ function splitForDingTalk(text, limit) {
   if (rest) chunks.push(rest)
   return chunks
 }
+
+const DBQUERY_PY = "# 只读查询：密码与 SQL 只从环境变量读，不落命令行、不落日志。\nimport json, os, sys, time\nimport pymysql\nstarted = time.time()\nconn = pymysql.connect(\n    host=os.environ['DB_HOST'],\n    port=int(os.environ.get('DB_PORT') or 3306),\n    user=os.environ['DB_USER'],\n    password=os.environ['DB_PASSWORD'],\n    database=os.environ.get('DB_NAME') or None,\n    connect_timeout=8,\n    read_timeout=20,\n)\ntry:\n    cur = conn.cursor()\n    cur.execute(\"SET SESSION TRANSACTION READ ONLY\")\n    cur.execute(\"START TRANSACTION READ ONLY\")\n    cur.execute(os.environ[\"DB_SQL\"])\n    columns = [d[0] for d in (cur.description or [])]\n    rows = cur.fetchall()[:50]\n    payload = {\n        \"columns\": columns,\n        \"rowCount\": len(rows),\n        \"rows\": [[str(c) for c in row] for row in rows],\n        \"elapsedMs\": int((time.time() - started) * 1000),\n    }\n    print(json.dumps(payload, ensure_ascii=False))\n    conn.rollback()\nfinally:\n    conn.close()"
 
 // 判断一个目录像不像代码项目的标记文件；projectMarkers 为空时不做筛选，全部收下。
 const PROJECT_MARKERS = ['.git', 'package.json', 'pom.xml', 'build.gradle', 'go.mod', 'pyproject.toml', 'Cargo.toml', 'composer.json', 'Gemfile']
@@ -350,6 +410,127 @@ export function apply(ctx, rawConfig) {
     return
   }
 
+  // ── 图片入站：钉钉下载 → attachments 落盘 → 作为图片内容块进 prompt ──
+  const attachments = typeof ctx.get === 'function' ? ctx.get('attachments') : undefined
+  let accessToken = { value: '', expiresAt: 0 }
+  async function getAccessToken() {
+    if (accessToken.value && Date.now() < accessToken.expiresAt - 60000) return accessToken.value
+    if (!cfg.clientId || !cfg.clientSecret) throw new Error('下载图片需要 clientId/clientSecret')
+    const response = await fetch('https://api.dingtalk.com/v1.0/oauth2/accessToken', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ appKey: cfg.clientId, appSecret: cfg.clientSecret }),
+    })
+    const payload = await response.json().catch(() => null)
+    if (!response.ok || !payload || !payload.accessToken) {
+      throw new Error("取 accessToken 失败：" + response.status + " " + oneLine(payload, 160))
+    }
+    accessToken = { value: payload.accessToken, expiresAt: Date.now() + (payload.expireIn || 7200) * 1000 }
+    return accessToken.value
+  }
+
+  /** 按 magic bytes 判断图片类型，钉钉返回的 content-type 不可靠。 */
+  function sniffImageMediaType(bytes, declared) {
+    if (declared && /^image\/(png|jpeg|webp|gif)$/.test(declared)) return declared
+    if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png"
+    if (bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg"
+    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return "image/gif"
+    if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return "image/webp"
+    return undefined
+  }
+
+  /** picture 消息的 downloadCode 可能在 content（对象或 JSON 串）里，也可能在 picture 下。 */
+  function pictureDownloadCode(raw) {
+    let content = raw && raw.content
+    if (typeof content === "string") {
+      try { content = JSON.parse(content) } catch { content = undefined }
+    }
+    const box = content && typeof content === "object" ? content : undefined
+    return (box && box.downloadCode) || (raw && raw.picture && raw.picture.downloadCode) || (raw && raw.picDownloadCode) || ""
+  }
+
+  async function downloadPicture(raw) {
+    const downloadCode = pictureDownloadCode(raw)
+    if (!downloadCode) throw new Error("图片消息里没有 downloadCode")
+    const robotCode = String((raw && raw.robotCode) || "") || cfg.clientId
+    const token = await getAccessToken()
+    const response = await fetch('https://api.dingtalk.com/v1.0/robot/messageFiles/download', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-acs-dingtalk-access-token': token },
+      body: JSON.stringify({ downloadCode, robotCode }),
+    })
+    const payload = await response.json().catch(() => null)
+    if (!response.ok || !payload || !payload.downloadUrl) {
+      throw new Error("取图片下载地址失败：" + response.status + " " + oneLine(payload, 160))
+    }
+    const file = await fetch(payload.downloadUrl)
+    if (!file.ok) throw new Error("下载图片失败：" + file.status)
+    const buffer = new Uint8Array(await file.arrayBuffer())
+    const mediaType = sniffImageMediaType(buffer, file.headers.get("content-type"))
+    if (!mediaType) throw new Error("下载到的内容不是支持的图片格式")
+    return { data: buffer, mediaType }
+  }
+
+  // ── 取数通道：TCP 可达性 + 只读 SELECT（密码走文件 → 环境变量） ──
+  const dbqueryPyPath = join(dataDir, "dbquery.py")
+  try { writeFileSync(dbqueryPyPath, DBQUERY_PY, "utf8") } catch (error) { log("dbquery/script-failed", error?.message ?? error) }
+
+  function pingHost(host, port) {
+    return new Promise((resolve) => {
+      const started = Date.now()
+      const socket = connect({ host, port })
+      let settled = false
+      const done = (reachable, error) => {
+        if (settled) return
+        settled = true
+        try { socket.destroy() } catch {}
+        resolve({ reachable, ms: Date.now() - started, error: error || "" })
+      }
+      socket.setTimeout(5000)
+      socket.once("connect", () => done(true, ""))
+      socket.once("timeout", () => done(false, "timeout"))
+      socket.once("error", (error) => done(false, (error && error.message) || "error"))
+    })
+  }
+
+  function runPythonSelect(conn, sql) {
+    return new Promise((resolve) => {
+      const env = { ...process.env, DB_HOST: conn.host, DB_PORT: String(conn.port), DB_USER: conn.user, DB_NAME: conn.database, DB_SQL: sql, DB_PASSWORD: readFileSync(conn.passwordFile, "utf8").trim() }
+      const started = Date.now()
+      const child = spawn(cfg.pythonPath || "python", [dbqueryPyPath], { env, windowsHide: true })
+      let stdout = ""
+      let stderr = ""
+      const timer = setTimeout(() => { try { child.kill() } catch {} }, 25000)
+      child.stdout.on("data", (chunk) => { stdout += chunk })
+      child.stderr.on("data", (chunk) => { stderr += String(chunk).slice(0, 600) })
+      child.on("error", (error) => { clearTimeout(timer); resolve({ ok: false, error: (error && error.message) || "spawn-failed", elapsedMs: Date.now() - started }) })
+      child.on("close", (code) => {
+        clearTimeout(timer)
+        const elapsedMs = Date.now() - started
+        if (code !== 0) return resolve({ ok: false, error: stderr || ("exit " + code), elapsedMs })
+        try { const parsed = JSON.parse(stdout.trim()); parsed.ok = true; parsed.elapsedMs = elapsedMs; resolve(parsed) }
+        catch (error) { resolve({ ok: false, error: "输出不是 JSON：" + stdout.slice(0, 200), elapsedMs }) }
+      })
+    })
+  }
+
+  // ── 工作区归档：侧边栏按 Workspace 分组，只给 cwd 不够 ──
+  const workspaces = typeof ctx.get === 'function' ? ctx.get('workspaceRegistry') : undefined
+  /** 确保 cwd 对应的 Workspace 存在；存在的直接复用（create 本身也是幂等的）。 */
+  async function ensureWorkspace(cwd) {
+    if (!workspaces || typeof workspaces.create !== "function") return undefined
+    try {
+      const owned = typeof workspaces.resolveByPath === "function" ? await workspaces.resolveByPath(cwd) : undefined
+      if (owned && owned.id) return owned.id
+      const created = await workspaces.create(cwd, basename(cwd))
+      log("workspace/created", { cwd, id: created && created.id, title: created && created.title })
+      return created && created.id
+    } catch (error) {
+      log("workspace/failed", { cwd, error: oneLine(error?.message ?? error, 200) })
+      return undefined
+    }
+  }
+
   const projectByName = (label) => state.projects.find((p) => p.name === label)
 
   function remember(inbound) {
@@ -412,6 +593,8 @@ export function apply(ctx, rawConfig) {
       return { sessionId: existing.sessionId, fresh: false, turn: existing.turn ?? 1 }
     }
     const request = { cwd: project.cwd }
+    const workspaceId = await ensureWorkspace(project.cwd)
+    if (workspaceId) request.workspaceId = workspaceId
     if (project.agentPreset) request.agentPreset = project.agentPreset
     const created = await session.create(request)
     const sessionId = created?.sessionId
@@ -444,6 +627,12 @@ export function apply(ctx, rawConfig) {
       : { msgtype: 'text', text: { content: text } }
     if (cfg.atReplier && atStaffId) {
       body.at = { atUserIds: [atStaffId], isAtAll: false }
+      // 钉钉 markdown 的原生 @ 需要正文里带 @+userId 占位，只给 atUserIds 不会渲染，
+      // 只会推一条提醒。text 消息则靠 atUserIds 自动渲染。
+      if (cfg.replyFormat === "markdown") {
+        const prefix = "@" + atStaffId + " "
+        if (!body.markdown.text.startsWith(prefix)) body.markdown.text = prefix + body.markdown.text
+      }
     }
     const response = await fetch(webhook, {
       method: 'POST',
@@ -481,11 +670,12 @@ export function apply(ctx, rawConfig) {
   }
 
   // ── prompt 构造 ──
-  function buildPrompt({ text, project, routeLabel, from, conversationId, first, turn, recreated, plain }) {
+  function buildPrompt({ text, project, routeLabel, from, conversationId, first, turn, recreated, plain, imageCount, envSkills }) {
     if (plain) return text
     const header = [
       `【钉钉消息】项目：${project.name}　入口：${routeLabel || conversationId}　提问人：${from || '未知'}　本会话第 ${turn ?? 1} 轮`,
       `内容：${text}`,
+      ...(imageCount > 0 ? [`附图：${imageCount} 张，已作为图片内容块随本条消息给你，先看图判断现象再决定查哪几面。`] : []),
       '',
     ]
     if (recreated) {
@@ -498,9 +688,18 @@ export function apply(ctx, rawConfig) {
       header.push(
         '你现在是这个入口的「运维排查主会话」，负责把问题查清并回一条能直接发出去的消息。请先调用 skill 工具加载 project-ops-triage，严格按它的流程工作：',
         '1. 先判定问题是否属于本项目；不属于就用一两句话说明并停手，不要发散。',
-        '2. 需要查证的部分按证据面拆开，用 subagent 开子会话并行查（数据库 / 日志 / 代码 / 工单 / 对端），每个子会话只查一条面。',
-        '3. 各面事实回到你这里汇总后再判断；只有单面证据的结论标成待核，不写成已确认。',
-        '4. 缺关键信息（环境、分支、目录、单号、账号）就停下来把问题列给我，由我转给提问人，不要猜。',
+        '1.5 判断问题类型再决定走多重的流程：',
+        '  · 取数/口径类（今天多少单、某单当前状态）：不要拆证据面、不要开子会话、不要沉淀链路。直接用本项目的环境 skill 连只读库或日志查，一次拿到结果就回复。输出固定四段：结论 → 数据源（生产/测试 + 库表或平台）→ 时点 → 口径。',
+        '  · 现象/异常类（报错、状态不对、同步没到）：走完整流程，先查链路库，命中按最短链路，未命中才拆面。',
+        '  · 变更类（订正、重推、改配置）：不要执行，只出方案并说明需要审批。',
+        '  · 查库时只读：SET SESSION TRANSACTION READ ONLY、只跑 SELECT/SHOW、必须带 LIMIT 与超时；密码走环境变量或密码文件，绝不出现在命令行、日志和回复里。',
+        '  · 本项目的环境入口见这些 skill：' + ((envSkills && envSkills.length) ? envSkills.join('、') : '（未配置，缺这一面就明说没查）') + '。连接资料以这些 skill 为准，不要自己猜连接串、账号或机器。',
+        '2. 先查已沉淀的链路库：读 project-ops-triage 的 playbooks/INDEX.md。命中就按那条最短路径走，先读它的「不要走的路」；现象对不上状态值/报错原文/环境/统计口径就立刻换方向，不硬套。只有未命中才从零拆证据面。',
+        '3. 需要查证的部分按证据面拆开，用 subagent 开子会话并行查（数据库 / 日志 / 代码 / 工单 / 对端），每个子会话只查一条面。',
+        '4. 数据库和服务器不是必查项，先判断现象是否真指向它们再连；连之前先看本次会话实际挂载了哪些工具（MCP / SSH / 只读账号），缺的那一面就明说「这一面没查」，不要用推测补。',
+        '5. 数据库只读、服务器只读；任何写操作、高资源查询、改配置都要停下来走审批，不要在群里承诺已经改了。',
+        '6. 各面事实回到你这里汇总后再判断；只有单面证据的结论标成待核，不写成已确认。',
+        '7. 缺关键信息（环境、分支、目录、单号、账号）就停下来把问题列给我，由我转给提问人，不要猜。',
         '',
         '输出要求：',
         '- 本轮只输出一条可以直接发出去的消息，不要输出过程流水账。',
@@ -512,7 +711,7 @@ export function apply(ctx, rawConfig) {
       header.push(
         '这是同一个入口的后续消息，可能是在追问上一个问题。处理规则：',
         '- 如果是对已有问题的追问或补充：沿用你之前为那个案子开的子会话继续查（用它的 continuable id 续聊），不要重开一套、不要重复已经查过的面；只补查缺口。',
-        '- 如果是新问题：按第 1 条起的新案子处理，先判定是否属于本项目，再拆证据面。',
+        '- 如果是新问题：按第 1 条起的新案子处理，先判定是否属于本项目，再查链路库（命中走最短链路，未命中才拆证据面）。',
         '- 拿不准是追问还是新问题时，先用一句话向提问人确认，不要自行假设。',
         '',
         '输出要求同上：只输出一条可直接发出的消息，先结论后原因。',
@@ -533,7 +732,8 @@ export function apply(ctx, rawConfig) {
       .trim()
   }
 
-  async function runTurn({ sessionId, promptText, onAck }) {
+  async function runTurn({ sessionId, promptText, onAck, imageRefs }) {
+    const imageParts = (imageRefs || []).map((attachment) => ({ type: "image", attachment }))
     const requestId = `dt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), cfg.turnTimeoutMs)
@@ -542,8 +742,9 @@ export function apply(ctx, rawConfig) {
       requestId,
       sessionId,
       mode: 'queue',
-      content: [{ type: 'text', text: promptText }],
+      content: [{ type: "text", text: promptText }, ...imageParts],
     }, controller.signal)
+    promptPromise.catch(() => {}) // 立刻挂 handler：prompt 若在 follow 流期间被拒（如 session/agent-busy），避免 Node 判 unhandledRejection 让 dsh exit 1
 
     let afterSeq = -1
     const texts = []
@@ -647,16 +848,48 @@ export function apply(ctx, rawConfig) {
 
     const sink = makeSink(raw)
     const msgtype = String(raw?.msgtype ?? 'text')
-    if (msgtype !== 'text') {
-      await sink(`目前只处理文字提问（收到的是 ${msgtype}）。请把问题用文字再发一次。`)
+    const picked = []
+    let text = ''
+    if (msgtype === 'text') {
+      text = stripMentions(raw?.text?.content ?? '')
+    } else if (msgtype === 'picture' && cfg.images) {
+      try {
+        picked.push(await downloadPicture(raw))
+      } catch (error) {
+        log('image/download-failed', oneLine(error?.message ?? error, 200))
+        await sink(`截图没取到（${oneLine(error?.message ?? error, 160)}）。把关键信息用文字发一次，或者把报错原文贴一下。`)
+        return
+      }
+      text = stripMentions(raw?.text?.content ?? '')
+    } else {
+      await sink(`目前支持文字和图片（收到的是 ${msgtype}）。请把问题用文字或截图再发一次。`)
+      return
+    }
+    // 自检可以直接注入图片字节，绕过钉钉下载
+    if (Array.isArray(options.images)) picked.push(...options.images)
+
+    if (!text && picked.length === 0) {
+      await sink('消息里没有可处理的内容。')
       return
     }
 
-    const text = stripMentions(raw?.text?.content ?? '')
-    if (!text) {
-      await sink('消息里没有可处理的文字内容。')
-      return
+    const imageRefs = []
+    if (picked.length > 0) {
+      if (!attachments || typeof attachments.saveImage !== 'function') {
+        await sink('收到图片，但当前环境没挂上 attachments 服务，看不了图。请把关键信息用文字发一次。')
+        return
+      }
+      for (const image of picked) {
+        try {
+          imageRefs.push(await attachments.saveImage({ data: image.data, mediaType: image.mediaType, name: image.name }))
+        } catch (error) {
+          log('image/save-failed', oneLine(error?.message ?? error, 200))
+          await sink(`图片存不下来（${oneLine(error?.message ?? error, 160)}）。换成文字描述再发一次。`)
+          return
+        }
+      }
     }
+    if (!text && imageRefs.length > 0) text = '（图片提问，无文字说明）'
 
     const bindingKey = isGroup
       ? `g:${conversationId}`
@@ -677,30 +910,30 @@ export function apply(ctx, rawConfig) {
     }
 
     const resolved = resolveRoute({ conversationId, senderStaffId, senderNick, isGroup })
-    if (resolved.error) {
-      await sink(resolved.error)
-      log('inbound/unrouted', { conversationId, senderStaffId, senderNick, isGroup })
-      return
-    }
-    const projectResolved = resolveProject(resolved.route)
-    if (projectResolved.error) {
-      await sink(projectResolved.error)
-      log('inbound/bad-project', { project: resolved.route.project })
-      return
-    }
-    const { project } = projectResolved
-    const routeLabel = resolved.route.label || resolved.route.project
-
+    const projectResolved = resolved.error ? undefined : resolveProject(resolved.route)
+    const project = projectResolved && projectResolved.project ? projectResolved.project : undefined
+    const routeLabel = resolved.route ? (resolved.route.label || resolved.route.project) : ''
+    // 入站即记录：还没绑定项目的新群，也要能在 /status 的 recent 里拿到自己的 id
     remember({
       key: bindingKey,
       kind: isGroup ? 'group' : 'dm',
       conversationId,
       senderStaffId,
       senderNick,
-      route: routeLabel,
-      project: project.name,
-      matchedBy: resolved.source,
+      route: routeLabel || '（未绑定）',
+      project: project ? project.name : '',
+      matchedBy: resolved.source ?? '',
     })
+    if (resolved.error) {
+      await sink(resolved.error)
+      log('inbound/unrouted', { conversationId, senderStaffId, senderNick, isGroup })
+      return
+    }
+    if (!project) {
+      await sink(projectResolved && projectResolved.error ? projectResolved.error : '项目解析失败。')
+      log('inbound/bad-project', { project: resolved.route.project })
+      return
+    }
 
     const existedBefore = Boolean(state.bindings[bindingKey])
     let sessionId
@@ -727,6 +960,8 @@ export function apply(ctx, rawConfig) {
       first: turn <= 1,
       turn,
       recreated,
+      imageCount: imageRefs.length,
+      envSkills: cfg.envSkills[project.name] || [],
       plain: options.plain === true,
     })
 
@@ -743,7 +978,7 @@ export function apply(ctx, rawConfig) {
     try {
       let result
       try {
-        result = await runTurn({ sessionId, promptText, onAck: ack })
+        result = await runTurn({ sessionId, promptText, onAck: ack, imageRefs })
       } catch (error) {
         // 主会话可能已被用户在网页端删掉：清掉绑定、重建一次再试。
         if (!/not.?found/i.test(String(error?.message ?? ''))) throw error
@@ -762,9 +997,11 @@ export function apply(ctx, rawConfig) {
           first: true,
           turn,
           recreated: true,
+          imageCount: imageRefs.length,
+          envSkills: cfg.envSkills[project.name] || [],
           plain: options.plain === true,
         })
-        result = await runTurn({ sessionId, promptText: retryPrompt, onAck: ack })
+        result = await runTurn({ sessionId, promptText: retryPrompt, onAck: ack, imageRefs })
       }
       const answer = result.answer
       if (!answer) {
@@ -830,10 +1067,40 @@ export function apply(ctx, rawConfig) {
                 logPath,
               })
             }
+            if (url.pathname === '/dingtalk-triage/dbquery') {
+              const project = url.searchParams.get('project') || ''
+              const op = url.searchParams.get('op') || 'ping'
+              const conn = cfg.databases[project]
+              if (!conn) return json(res, 400, { error: '没有这个项目的数据库配置', configured: Object.keys(cfg.databases) })
+              if (op === 'ping') return json(res, 200, { project, host: conn.host, port: conn.port, ...(await pingHost(conn.host, conn.port)) })
+              const sql = (url.searchParams.get('sql') || '').trim()
+              if (!/^(select|show)\b/i.test(sql)) return json(res, 400, { error: '只允许 SELECT / SHOW' })
+              if (!conn.passwordFile) return json(res, 400, { error: '缺 passwordFile，无法认证' })
+              if (!/\blimit\b/i.test(sql)) return json(res, 400, { error: 'SQL 必须自带 LIMIT' })
+              try {
+                const result = await runPythonSelect(conn, sql)
+                log("dbquery/select", { project, ok: result.ok, rowCount: result.rowCount, elapsedMs: result.elapsedMs })
+                return json(res, result.ok ? 200 : 500, result)
+              } catch (error) {
+                return json(res, 500, { ok: false, error: oneLine(error?.message ?? error, 300) })
+              }
+            }
             if (url.pathname === '/dingtalk-triage/selftest') {
               const text = url.searchParams.get('text') ?? ''
               if (!text) return json(res, 400, { error: '缺少 text 参数' })
               const type = url.searchParams.get('type') === 'dm' ? 'dm' : 'group'
+              const extraImages = []
+              const imagePath = url.searchParams.get('imagePath')
+              if (imagePath) {
+                try {
+                  const bytes = readFileSync(imagePath)
+                  const mediaType = sniffImageMediaType(bytes, '')
+                  if (!mediaType) throw new Error('不是 png/jpeg/webp/gif')
+                  extraImages.push({ data: bytes, mediaType })
+                } catch (error) {
+                  return json(res, 400, { error: oneLine(error?.message ?? error, 300) })
+                }
+              }
               const raw = {
                 msgId: `selftest-${Date.now()}`,
                 conversationId: url.searchParams.get('conversationId') ?? (type === 'dm' ? 'selftest-dm' : 'selftest-group'),
@@ -845,7 +1112,7 @@ export function apply(ctx, rawConfig) {
                 senderNick: url.searchParams.get('senderNick') ?? (type === 'dm' ? '自检' : '自检'),
               }
               try {
-                await submit(raw, { plain: url.searchParams.get('plain') !== '0' })
+                await submit(raw, { plain: url.searchParams.get('plain') !== '0', images: extraImages })
                 return json(res, 200, { ok: true, lastTurn: state.lastTurn, bindings: state.bindings, recent: state.recent })
               } catch (error) {
                 return json(res, 500, { ok: false, error: oneLine(error?.message ?? error, 500) })
@@ -854,7 +1121,7 @@ export function apply(ctx, rawConfig) {
             return json(res, 404, { error: 'not found' })
           },
         }))
-        log('route/registered', '/dingtalk-triage/{status,selftest}')
+        log("route/registered", "/dingtalk-triage/{status,selftest,dbquery}")
       } catch (error) {
         log('route/register-failed', error?.message ?? error)
       }
@@ -877,7 +1144,9 @@ export function apply(ctx, rawConfig) {
     }
     const { DWClient, TOPIC_ROBOT } = sdk
     try {
+      if (takeOverStream()) log("stream/previous-closed", "已断开上一个实例的 Stream 连接")
       client = new DWClient({ clientId: cfg.clientId, clientSecret: cfg.clientSecret, debug: false })
+      publishStream(client)
       client.registerCallbackListener(TOPIC_ROBOT, (message) => {
         // 先 ack 再处理：ack 表示「消息已可靠收到」，不是「回答完了」。
         try {
@@ -924,6 +1193,7 @@ export function apply(ctx, rawConfig) {
       ctx.on('dispose', () => {
         try {
           client?.disconnect?.()
+          if (globalThis[STREAM_SLOT] === client) globalThis[STREAM_SLOT] = null
         } catch {
           // ignore
         }
