@@ -29,7 +29,7 @@ import { spawn } from 'node:child_process'
 
 export const name = 'dingtalk-triage'
 /** 热更标记：日志 boot 行会带上，用来确认跑的是哪版代码。 */
-const CODEREV = 'rev21'
+const CODEREV = 'rev23'
 /**
  * 进程级 Stream 单例。模块级变量在每个 import 实例里各有一份（换文件名热更时管不到旧模块），
  * globalThis 在同一 Host 进程内共享，所以任何新实例都能断开前任的连接，杜绝多实例抢同一条消息。
@@ -68,6 +68,7 @@ const DEFAULTS = {
   images: true,
   envSkills: {},
   playbookDir: '',
+  topicThreshold: 0.5,
   selfBaseUrl: 'http://127.0.0.1:43129',
   databases: {},
   projectRoots: [],
@@ -94,6 +95,7 @@ const CONFIG_JSON_SCHEMA = {
     images: { type: 'boolean' },
     envSkills: { type: 'object' },
     playbookDir: { type: 'string' },
+    topicThreshold: { type: 'number' },
     selfBaseUrl: { type: 'string' },
     databases: { type: 'object' },
     projectRoots: { type: 'array', items: { type: 'string' } },
@@ -215,6 +217,7 @@ function normalize(raw) {
     images: bool(source.images, DEFAULTS.images),
     envSkills: normalizeEnvSkills(source.envSkills),
     playbookDir: str(source.playbookDir, ''),
+    topicThreshold: num(source.topicThreshold, 0.5),
     selfBaseUrl: str(source.selfBaseUrl, 'http://127.0.0.1:43129'),
     databases: normalizeDatabases(source.databases),
     allowedStaffIds: list(source.allowedStaffIds).filter((id) => typeof id === 'string' && id.length > 0),
@@ -285,6 +288,32 @@ function splitForDingTalk(text, limit) {
 
 const DBQUERY_PY = "# 只读查询：密码与 SQL 只从环境变量读，不落命令行、不落日志。\nimport json, os, sys, time\nimport pymysql\nstarted = time.time()\nconn = pymysql.connect(\n    host=os.environ['DB_HOST'],\n    port=int(os.environ.get('DB_PORT') or 3306),\n    user=os.environ['DB_USER'],\n    password=os.environ['DB_PASSWORD'],\n    database=os.environ.get('DB_NAME') or None,\n    connect_timeout=8,\n    read_timeout=20,\n)\ntry:\n    cur = conn.cursor()\n    cur.execute(\"SET SESSION TRANSACTION READ ONLY\")\n    cur.execute(\"START TRANSACTION READ ONLY\")\n    cur.execute(os.environ[\"DB_SQL\"])\n    columns = [d[0] for d in (cur.description or [])]\n    rows = cur.fetchall()[:50]\n    payload = {\n        \"columns\": columns,\n        \"rowCount\": len(rows),\n        \"rows\": [[str(c) for c in row] for row in rows],\n        \"elapsedMs\": int((time.time() - started) * 1000),\n    }\n    print(json.dumps(payload, ensure_ascii=False))\n    conn.rollback()\nfinally:\n    conn.close()"
 
+// 追问常见开头：出现这些词且与前文有重叠，才算延续上一案
+const FOLLOW_UP_HINTS = ['那', '这', '它', '还有', '再', '继续', '同样', '一样', '换成', '改成', '刚才', '上面', '这个单', '呢', '为什么', '然后']
+
+function bigramSet(text) {
+  const s = String(text).replace(/[\s\p{P}]+/gu, '').toLowerCase()
+  const set = new Set()
+  for (let i = 0; i < s.length - 1; i += 1) set.add(s.slice(i, i + 2))
+  if (s.length === 1) set.add(s)
+  return set
+}
+
+/** 两个问题的相似度（0~1）：字符二元组 Dice 系数。同一案子追问通常 >0.5。 */
+function topicSimilarity(a, b) {
+  const A = bigramSet(a)
+  const B = bigramSet(b)
+  if (A.size === 0 || B.size === 0) return 0
+  let shared = 0
+  for (const gram of A) if (B.has(gram)) shared += 1
+  return (2 * shared) / (A.size + B.size)
+}
+
+function matchesFollowUpHint(text) {
+  const s = String(text)
+  return FOLLOW_UP_HINTS.some((hint) => s.includes(hint))
+}
+
 // 判断一个目录像不像代码项目的标记文件；projectMarkers 为空时不做筛选，全部收下。
 const PROJECT_MARKERS = ['.git', 'package.json', 'pom.xml', 'build.gradle', 'go.mod', 'pyproject.toml', 'Cargo.toml', 'composer.json', 'Gemfile']
 
@@ -347,6 +376,7 @@ export function apply(ctx, rawConfig) {
     inflight: 0,
     lastTurn: { conversationId: '', at: 0, ok: false, chars: 0, error: '' },
     projects: [],
+    topicHistory: Object.create(null),
     // 最近出现过的入口身份：留着给 /status 用，方便把 conversationId / staffId 抄进配置。
     recent: [],
   }
@@ -969,6 +999,27 @@ export function apply(ctx, rawConfig) {
       return
     }
 
+    // ── 话题判定：同一入口不等于同一案子。与上一条问题比对，低相似度就另开会话。 ──
+    const priorBinding = state.bindings[bindingKey]
+    const priorText = priorBinding && priorBinding.lastText ? priorBinding.lastText : ''
+    const topicScore = priorText ? topicSimilarity(priorText, text) : 0
+    if (priorBinding && priorText) {
+      const hinted = matchesFollowUpHint(text) && text.length <= 30
+      const continued = topicScore >= cfg.topicThreshold || hinted
+      log(continued ? 'topic/continue' : 'topic/new-session', {
+        bindingKey,
+        score: Number(topicScore.toFixed(3)),
+        previous: priorBinding.sessionId,
+        previousText: priorText.slice(0, 40),
+        text: text.slice(0, 40),
+      })
+      if (!continued) {
+        state.topicHistory[bindingKey] = { last: priorBinding.sessionId, at: Date.now(), score: Number(topicScore.toFixed(3)) }
+        delete state.bindings[bindingKey]
+        saveBindings()
+      }
+    }
+
     const resolved = resolveRoute({ conversationId, senderStaffId, senderNick, isGroup })
     const projectResolved = resolved.error ? undefined : resolveProject(resolved.route)
     const project = projectResolved && projectResolved.project ? projectResolved.project : undefined
@@ -1070,6 +1121,10 @@ export function apply(ctx, rawConfig) {
         return
       }
       bumpTurn(bindingKey)
+      if (state.bindings[bindingKey]) {
+        state.bindings[bindingKey].lastText = text.slice(0, 200)
+        saveBindings()
+      }
       await sink(answer)
       state.lastTurn = { conversationId: bindingKey, at: Date.now(), ok: true, chars: answer.length, error: '' }
       log('turn/done', { bindingKey, sessionId, turn, chars: answer.length })
