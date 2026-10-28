@@ -29,7 +29,7 @@ import { spawn } from 'node:child_process'
 
 export const name = 'dingtalk-triage'
 /** 热更标记：日志 boot 行会带上，用来确认跑的是哪版代码。 */
-const CODEREV = 'rev24'
+const CODEREV = 'rev26'
 /**
  * 进程级 Stream 单例。模块级变量在每个 import 实例里各有一份（换文件名热更时管不到旧模块），
  * globalThis 在同一 Host 进程内共享，所以任何新实例都能断开前任的连接，杜绝多实例抢同一条消息。
@@ -612,6 +612,58 @@ export function apply(ctx, rawConfig) {
     log('playbook/seed-failed', error?.message ?? error)
   }
 
+  // ── 链路库：结构化条目（symptom / sql / params）+ 匹配 ──
+  function loadPlaybooks() {
+    const books = []
+    let files = []
+    try { files = readdirSync(playbookDir).filter((name) => name.endsWith(".md") && name !== "TEMPLATE.md" && name !== "INDEX.md") } catch { return books }
+    for (const file of files) {
+      let text = ""
+      try { text = readFileSync(join(playbookDir, file), "utf8") } catch { continue }
+      const symptomMatch = text.match(/^symptom:\s*(.+)$/m)
+      const sqlMatch = text.match(/^sql:\s*([\s\S]*?)(?=\n[a-z_]+:|\n\n|$)/m)
+      const paramsMatch = text.match(/^params:\s*(.+)$/m)
+      const heading = text.match(/^#\s+(.+)$/m)
+      books.push({
+        name: file.replace(/\.md$/, ""),
+        symptom: symptomMatch ? symptomMatch[1].trim() : (heading ? heading[1].trim() : file),
+        sql: sqlMatch ? sqlMatch[1].replace(/\s+/g, " ").trim() : "",
+        params: paramsMatch ? paramsMatch[1].trim() : "",
+      })
+    }
+    return books
+  }
+
+  /** 命中：取相似度最高的一条；与次高差距 < 0.05 视为有歧义，只给名字不预执行。 */
+  function matchPlaybook(text) {
+    const books = loadPlaybooks()
+    const scored = books
+      .map((book) => ({ book, score: topicSimilarity(text, book.symptom + " " + book.name) }))
+      .sort((a, b) => b.score - a.score)
+    const best = scored[0]
+    if (!best || best.score < 0.25) return { matched: null, ambiguous: [] }
+    const second = scored[1]
+    if (second && second.score >= 0.25 && best.score - second.score < 0.05) {
+      return { matched: null, ambiguous: scored.filter((item) => item.score >= 0.25).slice(0, 3).map((item) => item.book.name) }
+    }
+    return { matched: best.book, score: best.score, ambiguous: [] }
+  }
+
+  /** 模板 SQL 的日期占位：{{date}} 用提问里的日期，没有就用今天。 */
+  function substituteDate(sql, date) {
+    // 必须替换成带引号的字面量，否则 MySQL 会把 2026-10-28 当减法算式
+    return String(sql).replace(/\{\{date\}\}/g, "'" + date + "'")
+  }
+
+  function dateFromText(text) {
+    const iso = String(text).match(/(20\d{2})[-/](\d{1,2})[-/](\d{1,2})/)
+    if (iso) return iso[1] + "-" + String(iso[2]).padStart(2, "0") + "-" + String(iso[3]).padStart(2, "0")
+    const cn = String(text).match(/(\d{1,2})月(\d{1,2})日/)
+    const today = new Date()
+    if (cn) return today.getFullYear() + "-" + String(cn[1]).padStart(2, "0") + "-" + String(cn[2]).padStart(2, "0")
+    return new Date().toISOString().slice(0, 10)
+  }
+
   const projectByName = (label) => state.projects.find((p) => p.name === label)
 
   function remember(inbound) {
@@ -808,6 +860,17 @@ export function apply(ctx, rawConfig) {
         '输出要求同上：只输出一条可直接发出的消息，先结论后原因。',
       )
     }
+    const hits = matchPlaybook(text)
+    if (hits.matched) {
+      header.push('')
+      header.push('命中链路库：' + hits.matched.name + '（相似度 ' + hits.score.toFixed(2) + '）。' + (hits.matched.sql
+        ? '直接调 GET ' + cfg.selfBaseUrl + '/dingtalk-triage/playbook?op=run&name=' + hits.matched.name + '&project=' + project.name + '&date=<日期> 取数，逐字使用返回结果，禁止自己改写 SQL 或口径（改写口径必须先问提问人）。'
+        : '按该文件的最短路径手动执行，不要改写其中的口径。'))
+    } else if (hits.ambiguous.length > 0) {
+      header.push('')
+      header.push('链路库有多个候选：' + hits.ambiguous.join('、') + '。先调 GET ' + cfg.selfBaseUrl + '/dingtalk-triage/playbook?op=list 选一条；选不准就问提问人，不要自己另算口径。')
+    }
+
     return header.join('\n')
   }
 
@@ -1208,6 +1271,29 @@ export function apply(ctx, rawConfig) {
                 return json(res, 200, { total: events.length, tail: out })
               } catch (error) {
                 return json(res, 500, { error: oneLine(error?.message ?? error, 300) })
+              }
+            }
+            if (url.pathname === '/dingtalk-triage/playbook') {
+              const op = url.searchParams.get('op') || 'list'
+              const books = loadPlaybooks()
+              if (op === 'list') return json(res, 200, { count: books.length, items: books.map((b) => ({ name: b.name, symptom: b.symptom, hasSql: Boolean(b.sql) })) })
+              const name = url.searchParams.get('name') || ''
+              const book = books.find((b) => b.name === name)
+              if (!book) return json(res, 400, { error: '没有这条链路', available: books.map((b) => b.name) })
+              if (!book.sql) return json(res, 400, { error: '这条链路没有可执行 SQL，按文件里的文字步骤排查', name: book.name })
+              const projectName = url.searchParams.get('project') || ''
+              const conn = cfg.databases[projectName]
+              if (!conn) return json(res, 400, { error: '没有这个项目的数据库配置', configured: Object.keys(cfg.databases) })
+              const date = url.searchParams.get('date') || dateFromText('')
+              const sql = substituteDate(book.sql, date)
+              if (!/^(select|show)\b/i.test(sql.trim())) return json(res, 400, { error: '模板 SQL 只能是 SELECT/SHOW' })
+              if (!/\blimit\b/i.test(sql)) return json(res, 400, { error: '模板 SQL 必须自带 LIMIT' })
+              try {
+                const result = await runPythonSelect(conn, sql)
+                log('playbook/run', { name: book.name, project: projectName, ok: result.ok, rowCount: result.rowCount })
+                return json(res, result.ok ? 200 : 500, { name: book.name, date, sql, ...result })
+              } catch (error) {
+                return json(res, 500, { ok: false, error: oneLine(error?.message ?? error, 300) })
               }
             }
             if (url.pathname === '/dingtalk-triage/dbquery') {
