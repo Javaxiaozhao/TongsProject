@@ -29,7 +29,7 @@ import { spawn } from 'node:child_process'
 
 export const name = 'dingtalk-triage'
 /** 热更标记：日志 boot 行会带上，用来确认跑的是哪版代码。 */
-const CODEREV = 'rev23'
+const CODEREV = 'rev24'
 /**
  * 进程级 Stream 单例。模块级变量在每个 import 实例里各有一份（换文件名热更时管不到旧模块），
  * globalThis 在同一 Host 进程内共享，所以任何新实例都能断开前任的连接，杜绝多实例抢同一条消息。
@@ -745,7 +745,8 @@ export function apply(ctx, rawConfig) {
       }
     }
     return async (text) => {
-      for (const chunk of splitForDingTalk(text, cfg.maxReplyChars)) {
+      const cleaned = String(text || '').replace(/^\s*(?:@[^\s@]{1,40}\s*)+/u, '')
+      for (const chunk of splitForDingTalk(cleaned, cfg.maxReplyChars)) {
         await sendViaWebhook(webhook, chunk, { atStaffId: raw.senderStaffId })
       }
     }
