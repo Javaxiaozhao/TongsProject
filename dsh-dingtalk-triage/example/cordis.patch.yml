@@ -1,0 +1,24 @@
+# 把这一段加进 $DSH_HOME/profiles/web/cordis.patch.yml
+# 改完保存即热生效；改 index.js 的代码需要重启桌面端（Harness 按「行 id + 文件路径」缓存模块）。
+- insert:
+    - id: dingtalk-triage-bridge
+      name: 'file:///C:/Users/you/.dsh/plugins/dsh-dingtalk-triage/index.js'
+      config:
+        enabled: true
+        clientId: ''          # 钉钉应用 Client ID（AppKey）
+        clientSecret: ''      # 钉钉应用 Client Secret（AppSecret）
+        dataDir: 'C:\Users\you\.dsh\data\dingtalk-triage'
+        requireMention: true
+        replyFormat: markdown
+        turnTimeoutMs: 900000
+        maxReplyChars: 3800
+        projects:
+          - name: 金地物业
+            cwd: 'D:/code/jindi'      # 改成真实绝对路径
+        routes:
+          - conversationId: 'cid金地运营群=='
+            project: 金地物业
+            label: 金地运营群
+          - senderStaffId: 'manager1234'   # 或 senderNick
+            project: 金地物业
+            label: 乐君兰单聊

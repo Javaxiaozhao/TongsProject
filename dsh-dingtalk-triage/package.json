@@ -1,0 +1,28 @@
+{
+  "name": "dsh-dingtalk-ops-triage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "钉钉 Stream 模式 → DeepSeek Harness 运维排查主会话桥",
+  "exports": {
+    ".": "./index.js"
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.0-rc.1"
+  },
+  "dependencies": {
+    "dingtalk-stream": "2.1.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Javaxiaozhao/TongsProject.git"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dingtalk",
+    "dingtalk-stream",
+    "ops-triage"
+  ]
+}
