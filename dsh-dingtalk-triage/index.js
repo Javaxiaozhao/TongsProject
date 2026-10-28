@@ -29,7 +29,7 @@ import { spawn } from 'node:child_process'
 
 export const name = 'dingtalk-triage'
 /** 热更标记：日志 boot 行会带上，用来确认跑的是哪版代码。 */
-const CODEREV = 'rev28'
+const VERSION = '1.1.0'
 /**
  * 进程级 Stream 单例。模块级变量在每个 import 实例里各有一份（换文件名热更时管不到旧模块），
  * globalThis 在同一 Host 进程内共享，所以任何新实例都能断开前任的连接，杜绝多实例抢同一条消息。
@@ -339,7 +339,7 @@ export function apply(ctx, rawConfig) {
   }
 
   log('boot', {
-    rev: CODEREV,
+    version: VERSION,
     enabled: cfg.enabled,
     clientId: cfg.clientId ? redact(cfg.clientId) : '',
     hasSecret: cfg.clientSecret.length > 0,
@@ -543,7 +543,13 @@ export function apply(ctx, rawConfig) {
       child.on("close", (code) => {
         clearTimeout(timer)
         const elapsedMs = Date.now() - started
-        if (code !== 0) return resolve({ ok: false, error: stderr || ("exit " + code), elapsedMs })
+        if (code !== 0) {
+          const missingPymysql = /No module named '?pymysql'?/i.test(stderr)
+          const hint = missingPymysql
+            ? "目标 Python 缺 pymysql：执行 " + (cfg.pythonPath || "python") + " -m pip install pymysql，或把 pythonPath 换成装好它的解释器。原始错误：" + stderr
+            : stderr
+          return resolve({ ok: false, error: hint || ("exit " + code), elapsedMs })
+        }
         try { const parsed = JSON.parse(stdout.trim()); parsed.ok = true; parsed.elapsedMs = elapsedMs; resolve(parsed) }
         catch (error) { resolve({ ok: false, error: "输出不是 JSON：" + stdout.slice(0, 200), elapsedMs }) }
       })

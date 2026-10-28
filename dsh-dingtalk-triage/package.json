@@ -1,6 +1,6 @@
 {
   "name": "dsh-dingtalk-triage",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "钉钉 Stream 模式 → DeepSeek Harness 运维排查主会话（项目按目录发现、链路库先匹配后沉淀）",
   "type": "module",
   "main": "./index.js",
