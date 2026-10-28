@@ -57,23 +57,25 @@
         dataDir: 'C:\Users\you\.dsh\data\dingtalk-triage'
         requireMention: true
         replyFormat: markdown
-        projects:
-          - name: 金地物业
-            cwd: 'D:\code\jindi'
+        # 项目不写死：扫这些根目录，每个非点号子目录就是一个项目（目录名=项目名）
+        projectRoots:
+          - 'D:\code'
+        excludedProjects:
+          - '315'
         routes:
-          # 群：按 conversationId，一群一项目
+          # 群：按 conversationId
           - conversationId: 'cid金地运营群=='
-            project: 金地物业
+            project: jindi
             label: 金地运营群
           # 单聊：按 senderStaffId（最稳）或 senderNick
-          - senderStaffId: 'manager1234'
-            project: 金地物业
+          - senderNick: 乐君兰
+            project: jindi
             label: 乐君兰单聊
           - senderNick: 周贝
-            project: 金地物业
+            project: jindi
             label: 周贝单聊
           - senderNick: 谭圆圆
-            project: 金地物业
+            project: jindi
             label: 谭圆圆单聊
 ```
 
@@ -93,18 +95,35 @@
 | `turnTimeoutMs` | 15 分钟 | 一轮超过就取消并回报超时 |
 | `maxReplyChars` | 3800 | 单条上限，超长按段落切分多条发 |
 | `projects` | `[]` | `name` + `cwd`（+ 可选 `agentPreset`） |
-| `projects` | `[]` | `name` + `cwd`（+ 可选 `agentPreset`）；`cwd` 必须是真实绝对路径 |
+| `projectRoots` | `[]` | 扫描根；根下每个非点号子目录自动成为一个项目（目录名=项目名，cwd=该目录） |
+| `excludedProjects` | `[]` | 按目录名精确排除，如 `['315']` |
+| `projectMarkers` | `[]` | 非空时只保留含这些标记文件的目录，如 `['.git','pom.xml']` |
+| `projects` | `[]` | 手工补充/覆盖，同名优先于扫描结果 |
 | `routes` | `[]` | 入口 → 项目：`conversationId`（群）/ `senderStaffId` / `senderNick`（单聊），配 `project` 和 `label` |
 | `defaultProject` | 空 | 只给单聊兜底用；群里不生效，避免消息串项目 |
 | `newCommand` | `/new` | 清掉当前会话、下一条开新会话（换话题用） |
 | `allowedStaffIds` | `[]` | 非空时只处理这些人的消息 |
 | `selftest` | `true` | 注册 `/dingtalk-triage/*` 自检路由 |
 
+### 项目自动发现
+
+`projectRoots` 下每个非点号子目录就是一个项目，**目录名就是 `routes` 里要写的项目名**：
+
+```
+D:\code
+├─ jindi      → 项目 jindi（单仓，有 .git）
+├─ fesco      → 项目 fesco（多仓集合目录，照样当一个项目用，主会话自己进去找）
+└─ 315        → 在 excludedProjects 里排掉
+```
+
+不用再维护 `projects` 列表。加新仓库只要目录在扫描根下，`/dingtalk-triage/status?refresh=1` 就能看到（启动时也会自动扫一次）。
+手工 `projects` 仍然保留，用来给扫描根之外的目录起别名，或覆盖同名项。
+
 ### 改完配置怎么生效
 
 profile 补丁层是热加载的：保存 `cordis.patch.yml` 后几秒内自动重载，**改配置不用重启**。
 
-改 `index.js` 里的**代码**则需要重启桌面端——Harness 的模块缓存按「行 id + 文件路径」固化，只改文件内容不会重新 import。想不重启迭代，得同时换一个新的行 id 和新的文件名（本插件在开发期就是这么滚过来的：`v2` → `v3`）。
+改 `index.js` 里的**代码**则需要重启桌面端——Harness 的模块缓存按「行 id + 文件路径」固化，只改文件内容不会重新 import。想不重启迭代，得同时换一个新的行 id 和新的文件名（本插件开发期就是从 v2 一路滚到 v6 的）。
 
 ## 三、自检与排障
 

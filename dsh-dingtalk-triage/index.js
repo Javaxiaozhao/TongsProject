@@ -22,12 +22,12 @@
  * - 会话被删/丢失：检测到 not-found 就重建一次，并在 prompt 里说明「上文的
  *   会话已不在，若是追问请先向提问人确认上次结论」，不假装记得。
  */
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const name = 'dingtalk-triage'
 /** 热更标记：日志 boot 行会带上，用来确认跑的是哪版代码。 */
-const CODEREV = 'rev8'
+const CODEREV = 'rev9'
 /** 只依赖会话控制器；webServer 用可选查找，缺了也不影响钉钉主链路。 */
 export const inject = ['sessionController']
 
@@ -47,6 +47,9 @@ const DEFAULTS = {
   maxReplyChars: 3800,
   selftest: true,
   newCommand: '/new',
+  projectRoots: [],
+  excludedProjects: [],
+  projectMarkers: [],
 }
 
 const CONFIG_JSON_SCHEMA = {
@@ -65,6 +68,9 @@ const CONFIG_JSON_SCHEMA = {
     maxReplyChars: { type: 'number' },
     selftest: { type: 'boolean' },
     defaultProject: { type: 'string' },
+    projectRoots: { type: 'array', items: { type: 'string' } },
+    excludedProjects: { type: 'array', items: { type: 'string' } },
+    projectMarkers: { type: 'array', items: { type: 'string' } },
     allowedStaffIds: { type: 'array', items: { type: 'string' } },
     projects: {
       type: 'array',
@@ -143,6 +149,9 @@ function normalize(raw) {
     maxReplyChars: num(source.maxReplyChars, DEFAULTS.maxReplyChars),
     selftest: bool(source.selftest, DEFAULTS.selftest),
     newCommand: str(source.newCommand, DEFAULTS.newCommand) || DEFAULTS.newCommand,
+    projectRoots: list(source.projectRoots).map((r) => str(r, '')).filter(Boolean),
+    excludedProjects: list(source.excludedProjects).map((r) => str(r, '')).filter(Boolean),
+    projectMarkers: list(source.projectMarkers).map((r) => str(r, '')).filter(Boolean),
     defaultProject: str(source.defaultProject, ''),
     allowedStaffIds: list(source.allowedStaffIds).filter((id) => typeof id === 'string' && id.length > 0),
     projects,
@@ -210,6 +219,9 @@ function splitForDingTalk(text, limit) {
   return chunks
 }
 
+// 判断一个目录像不像代码项目的标记文件；projectMarkers 为空时不做筛选，全部收下。
+const PROJECT_MARKERS = ['.git', 'package.json', 'pom.xml', 'build.gradle', 'go.mod', 'pyproject.toml', 'Cargo.toml', 'composer.json', 'Gemfile']
+
 // ─────────────────────────────────────────────────────────────── 主体 ──
 
 export function apply(ctx, rawConfig) {
@@ -238,7 +250,7 @@ export function apply(ctx, rawConfig) {
     hasSecret: cfg.clientSecret.length > 0,
     dataDir,
     selftest: cfg.selftest,
-    projects: cfg.projects.map((p) => `${p.name} -> ${p.cwd}`),
+    projectRoots: cfg.projectRoots,
     routes: cfg.routes.map((r) => describeRoute(r)),
   })
 
@@ -268,9 +280,52 @@ export function apply(ctx, rawConfig) {
     queues: new Map(),
     inflight: 0,
     lastTurn: { conversationId: '', at: 0, ok: false, chars: 0, error: '' },
+    projects: [],
     // 最近出现过的入口身份：留着给 /status 用，方便把 conversationId / staffId 抄进配置。
     recent: [],
   }
+
+  /**
+   * 扫 work 根目录发现项目：根下每个非点号子目录算一个项目，目录名即项目名。
+   * 手工配置的 projects 先入表且同名优先，扫描只补它没覆盖的。
+   */
+  function scanProjects() {
+    const found = new Map()
+    for (const project of cfg.projects) {
+      found.set(project.name.toLowerCase(), { ...project, markers: [], source: "manual" })
+    }
+    for (const root of cfg.projectRoots) {
+      let entries
+      try {
+        entries = readdirSync(root, { withFileTypes: true })
+      } catch (error) {
+        log("projects/scan-failed", { root, error: error?.message ?? error })
+        continue
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        const name = entry.name
+        if (name.startsWith(".")) continue
+        if (cfg.excludedProjects.includes(name)) continue
+        if (found.has(name.toLowerCase())) continue
+        const cwd = join(root, name)
+        const markers = []
+        for (const marker of PROJECT_MARKERS) {
+          try {
+            if (existsSync(join(cwd, marker))) markers.push(marker)
+          } catch {
+            // 权限之类的问题忽略即可，不影响把目录当项目用
+          }
+        }
+        if (cfg.projectMarkers.length > 0 && !markers.some((m) => cfg.projectMarkers.includes(m))) continue
+        found.set(name.toLowerCase(), { name, cwd, agentPreset: "", markers, source: "scan", root })
+      }
+    }
+    return [...found.values()].sort((a, b) => a.name.localeCompare(b.name))
+  }
+
+  state.projects = scanProjects()
+  log("projects/discovered", state.projects.map((item) => item.name + " -> " + item.cwd))
 
   // ── bindings 持久化 ──
   try {
@@ -295,7 +350,7 @@ export function apply(ctx, rawConfig) {
     return
   }
 
-  const projectByName = (label) => cfg.projects.find((p) => p.name === label)
+  const projectByName = (label) => state.projects.find((p) => p.name === label)
 
   function remember(inbound) {
     const at = Date.now()
@@ -345,7 +400,7 @@ export function apply(ctx, rawConfig) {
     const project = projectByName(route.project)
     if (!project) {
       return {
-        error: `配置里的 routes 指向了不存在的项目「${route.project}」，请在 projects 里补上它的 name 和 cwd。`,
+        error: `找不到项目「${route.project}」。当前可用：${state.projects.map((p) => p.name).join("、") || "（未扫描到任何项目）"}。改 routes 里的 project，或把目录放进 projectRoots 扫描根。`,
       }
     }
     return { project }
@@ -759,10 +814,14 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             const url = new URL(req.url ?? '/', 'http://127.0.0.1')
             if (url.pathname === '/dingtalk-triage/status') {
+              if (url.searchParams.get('refresh') === '1') {
+                state.projects = scanProjects()
+                log('projects/discovered', state.projects.map((item) => item.name + ' -> ' + item.cwd))
+              }
               return json(res, 200, {
                 enabled: cfg.enabled,
                 stream: state.stream,
-                projects: cfg.projects,
+                projects: state.projects,
                 routes: cfg.routes.map((r) => ({ ...r, described: describeRoute(r) })),
                 bindings: state.bindings,
                 recent: state.recent,

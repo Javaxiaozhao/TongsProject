@@ -1,9 +1,9 @@
 {
   "name": "dsh-dingtalk-ops-triage",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "钉钉 Stream 模式 → DeepSeek Harness 运维排查主会话桥",
+  "description": "钉钉 Stream 模式 → DeepSeek Harness 运维排查主会话桥（项目按目录自动发现）",
   "exports": {
     ".": "./index.js"
   },
