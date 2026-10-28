@@ -29,7 +29,7 @@ import { spawn } from 'node:child_process'
 
 export const name = 'dingtalk-triage'
 /** 热更标记：日志 boot 行会带上，用来确认跑的是哪版代码。 */
-const CODEREV = 'rev20'
+const CODEREV = 'rev21'
 /**
  * 进程级 Stream 单例。模块级变量在每个 import 实例里各有一份（换文件名热更时管不到旧模块），
  * globalThis 在同一 Host 进程内共享，所以任何新实例都能断开前任的连接，杜绝多实例抢同一条消息。
@@ -67,6 +67,8 @@ const DEFAULTS = {
   newCommand: '/new',
   images: true,
   envSkills: {},
+  playbookDir: '',
+  selfBaseUrl: 'http://127.0.0.1:43129',
   databases: {},
   projectRoots: [],
   excludedProjects: [],
@@ -91,6 +93,8 @@ const CONFIG_JSON_SCHEMA = {
     defaultProject: { type: 'string' },
     images: { type: 'boolean' },
     envSkills: { type: 'object' },
+    playbookDir: { type: 'string' },
+    selfBaseUrl: { type: 'string' },
     databases: { type: 'object' },
     projectRoots: { type: 'array', items: { type: 'string' } },
     excludedProjects: { type: 'array', items: { type: 'string' } },
@@ -210,6 +214,8 @@ function normalize(raw) {
     defaultProject: str(source.defaultProject, ''),
     images: bool(source.images, DEFAULTS.images),
     envSkills: normalizeEnvSkills(source.envSkills),
+    playbookDir: str(source.playbookDir, ''),
+    selfBaseUrl: str(source.selfBaseUrl, 'http://127.0.0.1:43129'),
     databases: normalizeDatabases(source.databases),
     allowedStaffIds: list(source.allowedStaffIds).filter((id) => typeof id === 'string' && id.length > 0),
     projects,
@@ -531,6 +537,51 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  // ── 每个人自己的链路库：默认在 dataDir 下，首启播种索引与模板 ──
+  const playbookDir = cfg.playbookDir || join(dataDir, 'playbooks')
+  try {
+    mkdirSync(playbookDir, { recursive: true })
+    const indexPath = join(playbookDir, 'INDEX.md')
+    if (!existsSync(indexPath)) {
+      writeFileSync(indexPath, [
+        '# 排查链路索引',
+        '',
+        '| 链路 | 适用症状 | 最近验证 |',
+        '| --- | --- | --- |',
+        '',
+      ].join('\n'), 'utf8')
+    }
+    const templatePath = join(playbookDir, 'TEMPLATE.md')
+    if (!existsSync(templatePath)) {
+      writeFileSync(templatePath, [
+        '# <一句话：什么现象走这条链路>',
+        '',
+        '症状关键词：<业务怎么说这件事的几个词，用顿号分隔>',
+        '',
+        '## 最短路径',
+        '',
+        '1. <先查哪张表/哪个接口/哪个文件>',
+        '2. <一条可直接复制的 SQL 或命令>',
+        '',
+        '## 判读规则',
+        '',
+        '- <哪个字段代表什么，什么值算成功/失败>',
+        '',
+        '## 不要走的路',
+        '',
+        '- <这次踩过的坑：哪个字段看起来像证据其实不是>',
+        '',
+        '## 最近验证',
+        '',
+        '- <日期>：<结论一句话>',
+        '',
+      ].join('\n'), 'utf8')
+    }
+    log('playbook/ready', { dir: playbookDir })
+  } catch (error) {
+    log('playbook/seed-failed', error?.message ?? error)
+  }
+
   const projectByName = (label) => state.projects.find((p) => p.name === label)
 
   function remember(inbound) {
@@ -692,13 +743,15 @@ export function apply(ctx, rawConfig) {
         '1.5 判断问题类型再决定走多重的流程：',
         '  · 取数/口径类（今天多少单、某单当前状态）：不要拆证据面、不要开子会话、不要沉淀链路。直接用本项目的环境 skill 连只读库或日志查，一次拿到结果就回复。输出固定四段：结论 → 数据源（生产/测试 + 库表或平台）→ 时点 → 口径。',
         '  · 现象/异常类（报错、状态不对、同步没到）：走完整流程，先查链路库，命中按最短链路，未命中才拆面。',
-        '  · 需要查日志时：先读 C:/Users/tong/.codex/project-ops-triage/playbooks/common-orion-terminal-command.md，按里面已验证的 Orion 运维平台终端流程走（登录 → machine/list 核机器 → terminal/access 拿令牌 → WebSocket 发 1|cols|rows|token → 命令帧往返）。不要现场重新摸协议，也不要用本机 SSH 硬连生产机器。',
+        `  · 需要查日志或连机器时：先在 ${playbookDir}/INDEX.md 里找日志/终端类条目，命中就按那条已验证的连接与取数步骤走（含平台登录、核机器、拿终端令牌、命令帧往返的具体命令）。未命中才自己探，且探通后必须沉淀成新条目。不要用本机 SSH 硬连生产机器。`,
         '  · 查日志前先自证身份：hostname、id -un 确认机器与环境（生产/测试）；取内容只用 tail -n / sed -n / grep，禁止 tail -f、journalctl -f、watch、vim 这类交互命令。',
         '  · 取数类固定两步，不许自己另造通道：',
-        '    ① 先读 C:/Users/tong/.codex/project-ops-triage/playbooks/INDEX.md，命中就用文件里的 SQL 与口径，禁止再从代码反推口径；',
-        '    ② 再调 GET http://127.0.0.1:43129/dingtalk-triage/dbquery?project=<项目名>&op=select&sql=<urlencode后SQL> 取数（用 web_fetch 或 pwsh 的 Invoke-RestMethod 都行）。该通道已内置只读事务、SELECT/SHOW 白名单、强制 LIMIT；禁止自己拼 mysql 连接、禁止读凭据文件、禁止写临时 py 脚本。',
+        `    ① 先读 ${playbookDir}/INDEX.md，按症状关键词匹配；命中就照该文件的最短路径与口径执行，禁止再从代码反推口径；`,
+        `    ② 再调 GET ${cfg.selfBaseUrl}/dingtalk-triage/dbquery?project=<项目名>&op=select&sql=<urlencode后SQL> 取数（web_fetch 或 pwsh 的 Invoke-RestMethod 都行）。该通道已内置只读事务、SELECT/SHOW 白名单、强制 LIMIT；禁止自己拼 mysql 连接、禁止读凭据文件、禁止写临时 py 脚本。`,
         '    ③ 链路库未命中时才允许自己查证口径，且回复里必须注明「口径为本次查证」。',
         '  · 变更类（订正、重推、改配置）：不要执行，只出方案并说明需要审批。',
+        `  · 结案必须沉淀，不许跳过：给出结论后，在 ${playbookDir} 下新建或更新一条 .md（结构照 TEMPLATE.md：症状关键词 / 最短路径 / 判读规则 / 不要走的路 / 最近验证），并在 INDEX.md 登记或更新那一行。命中已有条目就只更新「最近验证」补新坑，不要另起一份；同一现象出现两份就合并并删掉旧的那份。`,
+        '  · 沉淀是给你下一次用的，不是给提问人看的；对外回复里不要提链路库、文件路径和 SQL。',
         '  · 查库时只读：SET SESSION TRANSACTION READ ONLY、只跑 SELECT/SHOW、必须带 LIMIT 与超时；密码走环境变量或密码文件，绝不出现在命令行、日志和回复里。',
         '  · 本项目的环境入口见这些 skill：' + ((envSkills && envSkills.length) ? envSkills.join('、') : '（未配置，缺这一面就明说没查）') + '。连接资料以这些 skill 为准，不要自己猜连接串、账号或机器。',
         '2. 先查已沉淀的链路库：读 project-ops-triage 的 playbooks/INDEX.md。命中就按那条最短路径走，先读它的「不要走的路」；现象对不上状态值/报错原文/环境/统计口径就立刻换方向，不硬套。只有未命中才从零拆证据面。',
