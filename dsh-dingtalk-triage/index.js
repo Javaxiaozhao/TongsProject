@@ -29,7 +29,7 @@ import { spawn } from 'node:child_process'
 
 export const name = 'dingtalk-triage'
 /** 热更标记：日志 boot 行会带上，用来确认跑的是哪版代码。 */
-const CODEREV = 'rev27'
+const CODEREV = 'rev28'
 /**
  * 进程级 Stream 单例。模块级变量在每个 import 实例里各有一份（换文件名热更时管不到旧模块），
  * globalThis 在同一 Host 进程内共享，所以任何新实例都能断开前任的连接，杜绝多实例抢同一条消息。
@@ -869,6 +869,7 @@ export function apply(ctx, rawConfig) {
       header.push('命中链路库：' + hits.matched.name + '（相似度 ' + hits.score.toFixed(2) + '）。' + (hits.matched.sql
         ? '直接调 GET ' + cfg.selfBaseUrl + '/dingtalk-triage/playbook?op=run&name=' + hits.matched.name + '&project=' + project.name + '&date=<日期> 取数，逐字使用返回结果，禁止自己改写 SQL 或口径（改写口径必须先问提问人）。'
         : '按该文件的最短路径手动执行，不要改写其中的口径。'))
+      header.push('    · 提问人明确指定了口径时（例如「所有订单」「不排除取消」「只要已确认」），一律以提问人指定为准，不许套用模板口径；此时改用 ' + cfg.selfBaseUrl + '/dingtalk-triage/dbquery 自行查询（仍须只读、SELECT、带 LIMIT），并在回复里注明「口径为提问人指定」。')
     } else if (hits.ambiguous.length > 0) {
       header.push('')
       header.push('链路库有多个候选：' + hits.ambiguous.join('、') + '。先调 GET ' + cfg.selfBaseUrl + '/dingtalk-triage/playbook?op=list 选一条；选不准就问提问人，不要自己另算口径。')
