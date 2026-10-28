@@ -29,7 +29,7 @@ import { spawn } from 'node:child_process'
 
 export const name = 'dingtalk-triage'
 /** 热更标记：日志 boot 行会带上，用来确认跑的是哪版代码。 */
-const CODEREV = 'rev26'
+const CODEREV = 'rev27'
 /**
  * 进程级 Stream 单例。模块级变量在每个 import 实例里各有一份（换文件名热更时管不到旧模块），
  * globalThis 在同一 Host 进程内共享，所以任何新实例都能断开前任的连接，杜绝多实例抢同一条消息。
@@ -797,7 +797,9 @@ export function apply(ctx, rawConfig) {
       }
     }
     return async (text) => {
-      const cleaned = String(text || '').replace(/^\s*(?:@[^\s@]{1,40}\s*)+/u, '')
+      const cleaned = String(text || '')
+        .replace(/^\s*(?:@[^\s@]{1,40}\s*)+/u, '')
+        .replace(/^(?:可直接发送|可直接回复|可直接发出|可直接发群|回复|答复|答复如下|结论)\s*[:：]\s*/u, '')
       for (const chunk of splitForDingTalk(cleaned, cfg.maxReplyChars)) {
         await sendViaWebhook(webhook, chunk, { atStaffId: raw.senderStaffId })
       }
@@ -845,6 +847,7 @@ export function apply(ctx, rawConfig) {
         '7. 缺关键信息（环境、分支、目录、单号、账号）就停下来把问题列给我，由我转给提问人，不要猜。',
         '',
         '输出要求：',
+        '  · 正文的第一句就是结论。不要写「可直接发送」「回复」「答复」「结论」这类标签前缀，也不要写提问人的名字或「XX，」这种称呼——原生 @ 已经提醒到他了。',
         '- 本轮只输出一条可以直接发出去的消息，不要输出过程流水账。',
         '- 先结论（是否已解决 / 卡在哪），再说原因与处理，再说需要业务配合的下一步。',
         '- 不要出现表名、字段名、堆栈、服务器路径、内部工单链接。',
