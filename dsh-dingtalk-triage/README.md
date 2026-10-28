@@ -1,188 +1,121 @@
 # dsh-dingtalk-triage
 
-钉钉群 @机器人 → 项目绑定主会话 → 按 `project-ops-triage` 流程排查 → 回复发回群。
+钉钉群/单聊 @机器人 → 按项目目录开主会话排查 → 回复并 @提问人。
 
-自研最小实现，只做一件事：把钉钉的「群 + @ + 文字」搬进一个绑定到项目目录的常驻 Harness 主会话，再把这一轮的最终回答搬回群。
+## 它做什么
 
-## 它做什么 / 不做什么
+- 钉钉 Stream 模式接入（WebSocket，**不需要公网 IP**）
+- 一个群/一个单聊绑定一个项目目录，会话 cwd 就是该目录，并在侧边栏归到该项目的工作区
+- **话题判定**：与上一条问题相似度高就续聊（追问带上下文），低就另开会话
+- **链路库**：首次启动自动生成空索引，每次排查结束由会话自己沉淀；下次先匹配，命中走最短路径
+- **取数执行器**：链路里写好的模板 SQL 由插件执行，模型不碰口径；提问人显式指定口径时以提问人为准
+- 图片入站、`/new` 换话题、超时兜底、会话被删/归档后自愈、单实例防抢占
 
-| 做 | 不做 |
-|---|---|
-| 接收钉钉 Stream 模式机器人消息（WebSocket，不需要公网 IP） | 不实现拆证据面、开子会话、判断根因——那是主会话按 skill 自己干的活 |
-| 一个群固定绑定一个项目目录，会话 cwd 就是那个目录 | 不做工单读写、不连数据库、不发 DING、不做审批 |
-| 群里只处理 `@机器人` 的消息 | 不支持图片/文件（会直接回「只处理文字提问」） |
-| 主会话这一轮的最终 assistant 文本原样发回群 | 不转发中间过程、不发工具调用细节 |
+## 前置条件
 
-## 数据流
+- DeepSeek Harness `0.2.x`（桌面端 0.11.x 自带）
+- Node `>=22`
+- 钉钉**企业内部应用**，且机器人接收模式 = Stream
 
-```
-钉钉群 @机器人
-   └─ Stream WebSocket（dingtalk-stream 2.1.5）
-        └─ 本插件：去重 / @ 门禁 / 群→项目解析
-             └─ sessionController.create(cwd=项目目录)   ← 首次
-             └─ sessionController.prompt(角色指令 + 群消息)
-                  └─ 主会话按 project-ops-triage 拆子会话排查
-             └─ sessionController.follow(...) 收集本轮 turn/end 前的最后一条 assistant 文本
-        └─ POST sessionWebhook（markdown / text）
-   └─ 群里看到回复
+## 一、安装
+
+```bash
+# 1. 放到任意目录，装依赖（只为一个 SDK）
+npm install
 ```
 
-## 一、钉钉侧准备（一次性）
-
-> 控制台措辞会随平台版本变化，以你看到的实际界面为准；下面是必经的五个环节。
-
-1. **建应用**：用企业管理员账号打开 <https://open-dev.dingtalk.com/>，「应用开发 → 企业内部应用 → 创建应用」。
-2. **加机器人能力**：进入应用 →「添加应用能力 → 机器人」，机器人**消息接收模式选「Stream 模式」**（选 HTTP 回调就需要公网地址，本插件不支持）。
-3. **开权限**：在「权限管理」里按控制台提示开通机器人消息相关权限即可；回复走 `sessionWebhook`，不需要额外的主动发消息权限。
-4. **发布版本**：「版本管理与发布 → 创建版本」，**可见范围必须包含要拉群的成员/部门**，提交后由管理员审批通过。未发布或不在可见范围内的机器人加不进群。
-5. **取凭据**：「凭证与基础信息」里拿 **Client ID（AppKey）** 和 **Client Secret（AppSecret）**。
-
-然后：
-
-6. 在目标群的「群设置 → 群机器人 → 添加机器人」里选中这个自建应用机器人。
-7. 群里 @机器人 发一句任意文字，看插件日志里的 `stream/inbound` 行，拿到这个群的 `conversationId`，填进下面的 `groups`。
-
-## 二、DSH 侧配置
-
-配置写在 profile 的补丁层 `$DSH_HOME/profiles/web/cordis.patch.yml`：
+2. 在 `$DSH_HOME/profiles/web/cordis.patch.yml` 追加一段（照 `example/cordis.patch.yml` 改）：
 
 ```yaml
 - insert:
-    - id: dingtalk-triage-bridge
-      name: 'file:///C:/Users/you/.dsh/plugins/dsh-dingtalk-triage/index.js'
+    - id: dingtalk-triage
+      name: 'file:///C:/你的路径/dsh-dingtalk-triage/index.js'
       config:
         enabled: true
-        clientId: 'ding你的ClientID'
-        clientSecret: '你的ClientSecret'
-        dataDir: 'C:\Users\you\.dsh\data\dingtalk-triage'
-        requireMention: true
-        replyFormat: markdown
-        # 项目不写死：扫这些根目录，每个非点号子目录就是一个项目（目录名=项目名）
-        projectRoots:
-          - 'D:\code'
-        excludedProjects:
-          - '315'
-        routes:
-          # 群：按 conversationId
-          - conversationId: 'cid金地运营群=='
-            project: jindi
-            label: 金地运营群
-          # 单聊：按 senderStaffId（最稳）或 senderNick
-          - senderNick: 乐君兰
-            project: jindi
-            label: 乐君兰单聊
-          - senderNick: 周贝
-            project: jindi
-            label: 周贝单聊
-          - senderNick: 谭圆圆
-            project: jindi
-            label: 谭圆圆单聊
+        clientId: '钉钉 Client ID'
+        clientSecret: '钉钉 Client Secret'
+        dataDir: 'C:\你的数据目录\dingtalk-triage'
+        selfBaseUrl: 'http://127.0.0.1:你的web端口'
 ```
 
-**怎么把真实的 id 抄出来**：把人拉进群/先给机器人发一条消息，然后打开 `http://127.0.0.1:43129/dingtalk-triage/status`，看 `recent` 数组——每条都带 `conversationId`、`senderStaffId`、`senderNick`、`matchedBy`，复制进 `routes` 即可。日志 `stream/inbound` 行里也有同样的字段。
+3. 重启一次桌面端（首装需要；之后改配置热生效）。
 
-**匹配顺序**：群只认 `conversationId`（不兜底，避免串项目）；单聊依次认 `senderStaffId` → `senderNick` → `conversationId` → `defaultProject`。昵称会改的话尽量用 `senderStaffId`。
+## 二、钉钉侧（最容易卡在这里）
 
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `enabled` | `false` | 关着就完全不启动，连路由都不注册 |
-| `clientId` / `clientSecret` | 空 | 钉钉应用凭据；任一为空则跳过连接，只保留自检路由 |
-| `dataDir` | 必须显式给 | 放 `bindings.json`（群→会话）和 `dingtalk-triage.log` |
-| `requireMention` | `true` | 群里必须 @机器人。字段缺失时会退回「文本里带 @」的判定 |
-| `replyFormat` | `markdown` | `markdown` 或 `text`；群不支持 markdown 时改 `text` |
-| `ackText` | `收到，开始排查。` | 收到后立刻回的一句；留空则不回 |
-| `atReplier` | `true` | 回复时 @提问人 |
-| `turnTimeoutMs` | 15 分钟 | 一轮超过就取消并回报超时 |
-| `maxReplyChars` | 3800 | 单条上限，超长按段落切分多条发 |
-| `projects` | `[]` | `name` + `cwd`（+ 可选 `agentPreset`） |
-| `projectRoots` | `[]` | 扫描根；根下每个非点号子目录自动成为一个项目（目录名=项目名，cwd=该目录） |
-| `excludedProjects` | `[]` | 按目录名精确排除，如 `['315']` |
-| `projectMarkers` | `[]` | 非空时只保留含这些标记文件的目录，如 `['.git','pom.xml']` |
-| `projects` | `[]` | 手工补充/覆盖，同名优先于扫描结果 |
-| `routes` | `[]` | 入口 → 项目：`conversationId`（群）/ `senderStaffId` / `senderNick`（单聊），配 `project` 和 `label` |
-| `defaultProject` | 空 | 只给单聊兜底用；群里不生效，避免消息串项目 |
-| `newCommand` | `/new` | 清掉当前会话、下一条开新会话（换话题用） |
-| `allowedStaffIds` | `[]` | 非空时只处理这些人的消息 |
-| `selftest` | `true` | 注册 `/dingtalk-triage/*` 自检路由 |
+1. <https://open-dev.dingtalk.com/> → 应用开发 → **企业内部应用** → 创建应用
+2. 添加应用能力 → **机器人** → 接收模式选 **Stream 模式**（不是 HTTP 回调）
+3. 权限管理：开机器人消息相关权限
+4. 版本管理与发布 → 创建版本 → **可见范围必须包含要拉群的同事** → 发布 → 管理员审批
+5. 凭证与基础信息 → 复制 **Client ID / Client Secret**
+6. 钉钉客户端 → 群设置 → 群机器人 → 添加该应用机器人
+7. 群里 @机器人 发一句话，到 `/dingtalk-triage/status` 的 `recent` 里复制 `conversationId`，填进 `routes`
 
-### 项目自动发现
+> 第 4 步没做，机器人就搜不到；改了能力/权限必须**重新创建版本并发布**。
 
-`projectRoots` 下每个非点号子目录就是一个项目，**目录名就是 `routes` 里要写的项目名**：
+## 三、配置字段
 
-```
-D:\code
-├─ jindi      → 项目 jindi（单仓，有 .git）
-├─ fesco      → 项目 fesco（多仓集合目录，照样当一个项目用，主会话自己进去找）
-└─ 315        → 在 excludedProjects 里排掉
-```
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `enabled` | 是 | 关着完全不启动 |
+| `clientId` / `clientSecret` | 是 | 钉钉应用凭据 |
+| `dataDir` | 是 | 放 `bindings.json`、日志、`playbooks/` |
+| `selfBaseUrl` | 是 | 本机 web 地址，`/dbquery`、`/playbook` 都用它 |
+| `projectRoots` | 二选一 | 扫描根；根下每个非点号子目录 = 一个项目（目录名=项目名） |
+| `projects` | 二选一 | 手工补充/覆盖，同名优先 |
+| `routes` | 是 | `conversationId`（群）/ `senderStaffId` 或 `senderNick`（单聊）→ `project` |
+| `excludedProjects` | 否 | 按目录名排除，如 `315` |
+| `envSkills` | 否 | 项目 → 环境 skill 名列表，如 `[xxx-production, xxx-test-connect]` |
+| `databases` | 否 | 项目 → `{host, port, user, database, passwordFile}`，`passwordFile` 存密码，**不要写进配置** |
+| `pythonPath` | 否 | 默认 `python`；用于只读查询 |
+| `topicThreshold` | 否 | 话题切换阈值，默认 0.5；切太碎就调低 |
+| `replyFormat` / `ackText` / `atReplier` / `turnTimeoutMs` | 否 | 回复形态 |
 
-不用再维护 `projects` 列表。加新仓库只要目录在扫描根下，`/dingtalk-triage/status?refresh=1` 就能看到（启动时也会自动扫一次）。
-手工 `projects` 仍然保留，用来给扫描根之外的目录起别名，或覆盖同名项。
+## 四、首次验证
 
-### 改完配置怎么生效
+| 检查 | 命令 | 期望 |
+| --- | --- | --- |
+| 连接 | `GET /dingtalk-triage/status` | `stream.connected=true`，路由数量正确 |
+| 管道 | `GET /dingtalk-triage/selftest?text=只回复好&conversationId=selftest-group` | `lastTurn.ok=true`（需先在 routes 里绑 `selftest-group`） |
+| 数据库 | `GET /dingtalk-triage/dbquery?project=xxx&op=ping` | `reachable=true` |
+| 数据库 | `GET /dingtalk-triage/dbquery?project=xxx&op=select&sql=SELECT 1 LIMIT 1` | 返回 rows |
+| 链路库 | `GET /dingtalk-triage/playbook?op=list` | 列出条目，带 `hasSql` 标记 |
+| 会话事件 | `GET /dingtalk-triage/inspect?session=<id>&tail=20` | 排查卡住时用，能看到进了哪一步 |
 
-profile 补丁层是热加载的：保存 `cordis.patch.yml` 后几秒内自动重载，**改配置不用重启**。
+## 五、链路库（插件最有价值的部分）
 
-改 `index.js` 里的**代码**则需要重启桌面端——Harness 的模块缓存按「行 id + 文件路径」固化，只改文件内容不会重新 import。想不重启迭代，得同时换一个新的行 id 和新的文件名（本插件开发期就是从 v2 一路滚到 v6 的）。
+- 位置：`<dataDir>/playbooks/`，首次启动生成 `INDEX.md` + `TEMPLATE.md`
+- 每条是一个 `.md`，结构固定；**可选的机器可读段**放在文件最前面：
 
-## 三、自检与排障
-
-不需要钉钉凭据也能验证整条链路：
-
-```powershell
-# 状态：连没连上、群映射、群→会话绑定、上一轮结果
-curl http://127.0.0.1:43129/dingtalk-triage/status
-
-# 干跑一轮：建会话 → prompt → 收集回答（走本地日志，不发钉钉）
-curl "http://127.0.0.1:43129/dingtalk-triage/selftest?plain=1&conversationId=selftest-group&text=只回复两个字：通过"
-
-# plain=0 走真实 triage 角色指令（会加载 skill）
+```yaml
+symptom: 今天多少单、有效订单数量、某天订单量
+sql: SELECT COUNT(*) FROM db.`order` WHERE create_time >= {{date}} AND is_deleted=0 LIMIT 5
+params: date
 ```
 
-- `plain=1` 只验证管道，`plain=0` 验证角色与 skill。
-- 日志：`<dataDir>/dingtalk-triage.log`，每行一个事件（`boot` / `stream/inbound` / `session/created` / `turn/done` / `turn/failed` / `sink/local`）。
-- 绑定：`<dataDir>/bindings.json`，删掉某个群那一行就等于让它下次重新开会话。
+- 带 `sql` 的条目：命中后由插件**逐字执行**，模型只负责措辞，口径改不了
+- 只有文字的条目：注入「最短路径 / 判读规则 / 不要走的路」，模型按步骤排查
+- 命中多条（症状相近）时只给候选，不预执行，避免「跑错 SQL 给出像真的数字」
+- 从空开始，第一次排查结束自动写第一条；沉淀越多越快，**单次成本不变**（只注入命中的那一条）
 
-常见现象：
+## 六、会话与话题
 
-| 现象 | 原因 |
-|---|---|
-| 群里 @ 了没反应 | `enabled` 为 false、凭据空、群没进 `groups`、或没 @（看日志 `inbound/mention-gate` / `inbound/unbound-group`） |
-| 回了「这个群还没绑定项目」 | 该 `conversationId` 不在 `groups` 里 |
-| 回了「单轮排查没跑完」 | 看同时间 `turn/failed` 行的 error 与 stack |
-| 网页端看不到会话 | 会话 cwd 是项目目录，按目录分组在侧边栏，可能被折叠 |
+| 情形 | 行为 |
+| --- | --- |
+| 与上一条问题相似度 ≥ `topicThreshold` | 留在同一会话（带上下文，这叫追问） |
+| 相似度低且不是指代式短句 | **另开会话**（同一项目、同一工作区） |
+| 带「那/这/它/还有/再/继续…」且 ≤30 字 | 视为追问 |
+| 发 `/new` | 强制清绑定，下一条开新会话 |
 
-## 四、追问与记忆
+判定结果写进日志（`topic/new-session` / `topic/continue` 带 score 和前后两句原文），阈值可调。
 
-追问要有记忆，靠两层，少一层都会出问题：
+## 七、已知限制
 
-**第一层：会话复用（插件负责）**
+- 只支持文字与图片；文件/视频回「暂不支持」
+- 一个应用一个机器人，不支持多账号
+- 同一入口串行处理；不同入口并行
+- 回复取本轮最后一条 assistant 文本
+- 热重载会中断正在跑的那一轮（会回「本轮没跑完：aborted」，重发即可）
 
-- 绑定键：群 `g:<conversationId>`，单聊 `d:<senderStaffId|senderNick>`。
-- 同一个键永远复用同一个 Harness 会话，追问直接进原会话，上下文天然连续；绑定写在 `<dataDir>/bindings.json`，重启桌面端也不丢。
-- 一个人无论从手机还是电脑私聊，`senderStaffId` 不变 → 还是同一个主会话。
-- 想换话题：发 `/new`，绑定被清掉，下一条消息开新会话（项目绑定不变）。
+## 排障
 
-**第二层：案子续查（prompt 约束）**
-
-光有会话上下文不够——模型很容易把追问当成新问题、从头再查一遍。所以非首轮 prompt 里明确写了：
-
-- 对已有问题的追问/补充 → 沿用之前为该案子开的子会话（continuable id 续聊），只补缺口，不重开一套；
-- 换了问题 → 按新案子处理；
-- 拿不准是追问还是新问题 → 先一句话向提问人确认，不自行假设。
-
-**会话丢了怎么办**
-
-主会话被人在网页端删掉时，插件会检测到 not-found，清掉绑定重建一次，并在 prompt 里明确告诉模型「上文已不在，若是追问先向提问人确认上次结论」——不假装记得，也不静默重开。
-
-**边界**
-
-一个群只有一个主会话，所以多人同时问不同问题时，上下文是共享的：主会话靠提问人身份 + 消息内容区分案子。如果哪天出现「A 的追问被 B 的问题串了」，正确的解法是给不同主题拆群，而不是给同一个群加多个会话。
-
-## 五、已知限制
-
-- 只处理 `text`；图片、文件、富文本一律回「只处理文字提问」。
-- 一个应用一个机器人；不支持多账号。
-- 群里串行处理（同一个群同一时刻只跑一轮），不同群之间并行。
-- 主会话回答用最后一条 assistant 文本；如果模型把结论拆成多条消息，只发最后一条。
-- 不做审批门禁：插件本身只读消息、只发文字，真正的变更审批仍由主会话按 skill 走 DING + 邮件。
+见 [TROUBLESHOOTING.md](./TROUBLESHOOTING.md)。
